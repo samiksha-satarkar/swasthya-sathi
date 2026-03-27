@@ -36,6 +36,8 @@ components/
   PatientForm.jsx       ← React form component
 pages/api/
   patients.js           ← Next.js API route (GET + POST)
+dashboard.js
+index.js
 ```
 
 ## 5. API Usage Examples

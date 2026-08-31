@@ -1,138 +1,237 @@
-// components/PatientForm.jsx
-// SwasthyaSathi · Add Patient Record
-// DiagnosisPanel is imported at the top and used inside the JSX — correctly wired.
+// pages/api/patients.js
+// SwasthyaSathi · Patients API Route (GET + POST + PATCH + DELETE)
+//
+// Every action that touches a patient record MUST insert an audit_log
+// row. If the audit insert fails, the whole request fails — we do NOT
+// return success without a matching audit entry.
+//
+// RLS enforcement: We create a Supabase client with the caller's
+// access token so Postgres RLS (village-based) filters automatically.
 
-import { useState } from 'react';
-import { insertPatient } from '../lib/patientService';
-import DiagnosisPanel from './DiagnosisPanel';
+import { createClient } from '@supabase/supabase-js';
 
-const INITIAL = {
-  name: '',
-  age: '',
-  gender: 'Female',
-  symptoms: '',
-  diagnosis: '',
-  village: '',
-};
+/**
+ * Create a Supabase client authenticated as the requesting user.
+ * RLS policies will scope data to the user's assigned villages.
+ */
+function getAuthClient(req) {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return { client: null, error: 'Missing or invalid Authorization header' };
+  }
+  const token = authHeader.replace('Bearer ', '');
+  const client = createClient(
+    process.env.NEXT_PUBLIC_SUPABASE_URL || '',
+    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || '',
+    { global: { headers: { Authorization: `Bearer ${token}` } } }
+  );
+  return { client, token, error: null };
+}
 
-export default function PatientForm({ onSuccess }) {
-  const [form, setForm]       = useState(INITIAL);
-  const [loading, setLoading] = useState(false);
-  const [message, setMessage] = useState(null);
+/**
+ * Insert an audit_log row. Returns { error } — caller MUST check this
+ * and fail the request if error is non-null.
+ */
+async function insertAudit(client, { workerId, patientId, action, detail }) {
+  const { error } = await client
+    .from('audit_log')
+    .insert([{
+      worker_id:  workerId,
+      patient_id: patientId || null,
+      action,
+      detail: detail || null,
+    }]);
+  return { error };
+}
 
-  const handleChange = (e) =>
-    setForm((prev) => ({ ...prev, [e.target.name]: e.target.value }));
+export default async function handler(req, res) {
+  // ── AUTH ──
+  const { client, error: authErr } = getAuthClient(req);
+  if (authErr) {
+    return res.status(401).json({ error: authErr });
+  }
 
-  // Called by DiagnosisPanel when AI returns — auto-fills the diagnosis field
-  const handleAIResult = (diagnosisText) => {
-    setForm((prev) => ({ ...prev, diagnosis: diagnosisText }));
-  };
+  const { data: { user }, error: userErr } = await client.auth.getUser();
+  if (userErr || !user) {
+    return res.status(401).json({ error: 'Invalid or expired session.' });
+  }
 
-  const handleSubmit = async (e) => {
-    e.preventDefault();
-    setLoading(true);
-    setMessage(null);
+  // ══════════════════════════════════════════════════════════
+  // GET — Fetch patients (RLS scopes to worker's active villages)
+  // ══════════════════════════════════════════════════════════
+  if (req.method === 'GET') {
+    const { village, limit = 50 } = req.query;
 
-    const { data, error } = await insertPatient({
-      ...form,
-      age: parseInt(form.age, 10),
-    });
+    let query = client
+      .from('patients')
+      .select('*')
+      .order('created_at', { ascending: false })
+      .limit(Number(limit));
 
-    setLoading(false);
-
-    if (error) {
-      setMessage({ type: 'error', text: `Error: ${error.message}` });
-      return;
+    if (village) {
+      query = query.ilike('village', `%${village}%`);
     }
 
-    setMessage({ type: 'success', text: `Patient "${data.name}" saved successfully!` });
-    setForm(INITIAL);
-    if (onSuccess) onSuccess(data);
-  };
+    const { data, error } = await query;
+    if (error) {
+      return res.status(500).json({ error: error.message });
+    }
 
-  return (
-    <form
-      onSubmit={handleSubmit}
-      style={{ maxWidth: 480, display: 'flex', flexDirection: 'column', gap: '1rem' }}
-    >
-      <h2>Add Patient Record</h2>
+    // Audit: log the view action
+    // For bulk fetches we log a single "view" with the count, not one per row.
+    const { error: auditErr } = await insertAudit(client, {
+      workerId:  user.id,
+      patientId: null,
+      action:    'view',
+      detail:    { type: 'list', count: data?.length || 0, village: village || null },
+    });
+    if (auditErr) {
+      console.error('[patients:GET] Audit insert failed:', auditErr.message);
+      return res.status(500).json({ error: 'Failed to write audit log. Request aborted.' });
+    }
 
-      {/* Name */}
-      <input
-        name="name"
-        value={form.name}
-        onChange={handleChange}
-        placeholder="Patient Name *"
-        required
-      />
+    return res.status(200).json(data);
+  }
 
-      {/* Age */}
-      <input
-        name="age"
-        type="number"
-        value={form.age}
-        onChange={handleChange}
-        placeholder="Age *"
-        min="1"
-        max="120"
-        required
-      />
+  // ══════════════════════════════════════════════════════════
+  // POST — Create a new patient
+  // ══════════════════════════════════════════════════════════
+  if (req.method === 'POST') {
+    const { name, age, gender, symptoms, diagnosis, village,
+            weight, temp, bp, spo2, duration, duration_unit } = req.body;
 
-      {/* Gender */}
-      <select name="gender" value={form.gender} onChange={handleChange} required>
-        <option value="Female">Female</option>
-        <option value="Male">Male</option>
-        <option value="Other">Other</option>
-      </select>
+    if (!name || !age || !gender || !village) {
+      return res.status(400).json({ error: 'Missing required fields: name, age, gender, village' });
+    }
 
-      {/* Village */}
-      <input
-        name="village"
-        value={form.village}
-        onChange={handleChange}
-        placeholder="Village *"
-        required
-      />
+    const row = {
+      name,
+      age: Number(age),
+      gender,
+      symptoms: symptoms || null,
+      diagnosis: diagnosis || null,
+      village,
+      weight: weight ? Number(weight) : null,
+      temp: temp ? Number(temp) : null,
+      bp: bp || null,
+      spo2: spo2 ? Number(spo2) : null,
+      duration: duration || null,
+      duration_unit: duration_unit || 'days',
+      created_by: user.id,
+    };
 
-      {/* Symptoms */}
-      <textarea
-        name="symptoms"
-        value={form.symptoms}
-        onChange={handleChange}
-        placeholder="Symptoms (e.g. Fever, Cough, Body Pain)"
-        rows={3}
-      />
+    // Insert patient (RLS will verify village is in worker's active assignments)
+    const { data, error } = await client
+      .from('patients')
+      .insert([row])
+      .select()
+      .single();
 
-      {/* ── AI Diagnosis Panel ──────────────────────────────────────
-          Sits between the symptoms textarea and the diagnosis field.
-          Reads symptoms/age/gender from form state.
-          When AI responds, onResult auto-fills the diagnosis field.
-      ────────────────────────────────────────────────────────────── */}
-      <DiagnosisPanel
-        symptoms={form.symptoms}
-        age={form.age}
-        gender={form.gender}
-        onResult={handleAIResult}
-      />
+    if (error) {
+      return res.status(500).json({ error: error.message });
+    }
 
-      {/* Diagnosis — auto-filled by AI, still editable by ASHA worker */}
-      <textarea
-        name="diagnosis"
-        value={form.diagnosis}
-        onChange={handleChange}
-        placeholder="Diagnosis / Notes (AI will fill this — you can edit)"
-        rows={2}
-      />
+    // Audit: MUST succeed or we fail the whole request
+    const { error: auditErr } = await insertAudit(client, {
+      workerId:  user.id,
+      patientId: data.id,
+      action:    'create',
+      detail:    { village: data.village },
+    });
+    if (auditErr) {
+      // Patient was created but audit failed — this is a problem.
+      // We can't un-create the patient from here (no transaction wrapper
+      // available via PostgREST), so log loudly and return error so the
+      // caller knows something went wrong.
+      console.error('[patients:POST] CRITICAL: Patient created but audit insert failed:', auditErr.message);
+      return res.status(500).json({ error: 'Patient saved but audit log failed. Contact administrator.' });
+    }
 
-      <button type="submit" disabled={loading}>
-        {loading ? 'Saving...' : 'Save Patient Record'}
-      </button>
+    // TODO: Notify the original worker when someone else edits their patient.
+    // This is an open policy question — do not implement notification behavior
+    // without explicit design decisions on: who gets notified, via what channel,
+    // and what happens if the notification fails.
 
-      {message && (
-        <p style={{ color: message.type === 'error' ? 'red' : 'green' }}>
-          {message.text}
-        </p>
-      )}
-    </form>
-  );
+    return res.status(201).json(data);
+  }
+
+  // ══════════════════════════════════════════════════════════
+  // PATCH — Update a patient record
+  // ══════════════════════════════════════════════════════════
+  if (req.method === 'PATCH') {
+    const { id, ...updates } = req.body;
+
+    if (!id) {
+      return res.status(400).json({ error: 'Missing patient id' });
+    }
+
+    // Remove fields that should not be directly updated
+    delete updates.created_by;
+    delete updates.created_at;
+    delete updates.id;
+
+    const { data, error } = await client
+      .from('patients')
+      .update(updates)
+      .eq('id', id)
+      .select()
+      .single();
+
+    if (error) {
+      return res.status(500).json({ error: error.message });
+    }
+
+    // Audit
+    const { error: auditErr } = await insertAudit(client, {
+      workerId:  user.id,
+      patientId: id,
+      action:    'update',
+      detail:    { fields_changed: Object.keys(updates) },
+    });
+    if (auditErr) {
+      console.error('[patients:PATCH] CRITICAL: Patient updated but audit insert failed:', auditErr.message);
+      return res.status(500).json({ error: 'Patient updated but audit log failed. Contact administrator.' });
+    }
+
+    // TODO: Notify the original worker when someone else edits their patient.
+
+    return res.status(200).json(data);
+  }
+
+  // ══════════════════════════════════════════════════════════
+  // DELETE — Delete a patient record
+  // ══════════════════════════════════════════════════════════
+  if (req.method === 'DELETE') {
+    const { id } = req.body || req.query;
+
+    if (!id) {
+      return res.status(400).json({ error: 'Missing patient id' });
+    }
+
+    const { error } = await client
+      .from('patients')
+      .delete()
+      .eq('id', id);
+
+    if (error) {
+      return res.status(500).json({ error: error.message });
+    }
+
+    // Audit
+    const { error: auditErr } = await insertAudit(client, {
+      workerId:  user.id,
+      patientId: id,
+      action:    'delete',
+    });
+    if (auditErr) {
+      console.error('[patients:DELETE] CRITICAL: Patient deleted but audit insert failed:', auditErr.message);
+      return res.status(500).json({ error: 'Patient deleted but audit log failed. Contact administrator.' });
+    }
+
+    return res.status(200).json({ success: true });
+  }
+
+  // Method not allowed
+  res.setHeader('Allow', ['GET', 'POST', 'PATCH', 'DELETE']);
+  return res.status(405).json({ error: `Method ${req.method} not allowed` });
 }

@@ -1,6 +1,8 @@
 import { useState, useEffect, useRef } from 'react';
 import Head from 'next/head';
+import { useRouter } from 'next/router';
 import { supabase } from '../lib/supabaseClient';
+import { useUser } from '../lib/authGuard';
 
 const GENDERS = ['Female', 'Male', 'Other'];
 const EMPTY_FORM = { name: '', age: '', gender: 'Female', symptoms: '', diagnosis: '', village: '', weight: '', temp: '', bp: '', spo2: '', duration: '', duration_unit: 'days' };
@@ -29,6 +31,8 @@ const T = {
 };
 
 export default function Dashboard() {
+  const router = useRouter();
+  const { user, loading: authLoading } = useUser();
   const [patients, setPatients]         = useState([]);
   const [form, setForm]                 = useState(EMPTY_FORM);
   const [ashaForm, setAshaForm]         = useState(EMPTY_ASHA);
@@ -56,22 +60,78 @@ export default function Dashboard() {
   const [aiLoading, setAiLoading]   = useState(false);
   const [aiResult, setAiResult]     = useState(null);
   const [aiError, setAiError]       = useState('');
+
+  // ── VILLAGE ASSIGNMENT STATE ──
+  const [assignedVillages, setAssignedVillages] = useState([]);
+  const [newVillage, setNewVillage]             = useState('');
+  const [villagesLoading, setVillagesLoading]   = useState(true);
   const t = T[lang] || T['en-IN'];
   const currentLang = LANGUAGES.find(l => l.code === lang);
 
+  // ── AUTH GATE ──
   useEffect(() => {
+    if (!authLoading && !user) {
+      router.replace('/login');
+    }
+  }, [user, authLoading, router]);
+
+  useEffect(() => {
+    if (!user) return; // Don't fetch data until authenticated
     loadPatients();
     loadAshaWorker();
+    loadAssignedVillages();
     if (typeof window !== 'undefined') {
       setVoiceSupported(!!(window.SpeechRecognition || window.webkitSpeechRecognition));
     }
-  }, []);
+  }, [user]);
+
+  async function handleLogout() {
+    await supabase.auth.signOut();
+    router.replace('/login');
+  }
+
+  // Show loading while checking auth
+  if (authLoading) {
+    return (
+      <>
+        <Head><title>SwasthyaSathi · Loading...</title></Head>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: '100vh', background: '#f4f9f6', fontFamily: "'DM Sans', sans-serif" }}>
+          <div style={{ textAlign: 'center' }}>
+            <div style={{ fontSize: '2.5rem', marginBottom: '1rem' }}>🌿</div>
+            <div style={{ color: '#5a7366', fontSize: '0.9rem' }}>Loading...</div>
+          </div>
+        </div>
+      </>
+    );
+  }
+
+  // Don't render if not authenticated (will redirect)
+  if (!user) return null;
+
+  // Helper to get the current session access token
+  async function getAccessToken() {
+    const { data: { session } } = await supabase.auth.getSession();
+    return session?.access_token || '';
+  }
 
   // ── PATIENTS ──
+  // All patient operations go through /api/patients which enforces:
+  //   1. Auth (session token)
+  //   2. Village-based RLS (only active village assignments)
+  //   3. Audit logging (every action creates an audit_log row)
   async function loadPatients() {
     setFetching(true);
-    const { data, error } = await supabase.from('patients').select('*').order('created_at', { ascending: false });
-    if (!error) setPatients(data || []);
+    try {
+      const token = await getAccessToken();
+      const res = await fetch('/api/patients?limit=200', {
+        headers: { 'Authorization': `Bearer ${token}` },
+      });
+      const data = await res.json();
+      if (res.ok) setPatients(data || []);
+      else console.error('[loadPatients]', data.error);
+    } catch (e) {
+      console.error('[loadPatients]', e.message);
+    }
     setFetching(false);
   }
 
@@ -79,25 +139,62 @@ export default function Dashboard() {
     e.preventDefault();
     if (!form.name || !form.age || !form.village) { showToast(t.fillFields, 'error'); return; }
     setLoading(true);
-    const row = { ...form, age: Number(form.age), weight: form.weight ? Number(form.weight) : null, temp: form.temp ? Number(form.temp) : null, spo2: form.spo2 ? Number(form.spo2) : null, duration: form.duration || null, duration_unit: form.duration_unit || 'days', bp: form.bp || null };
-    const { data, error } = await supabase.from('patients').insert([row]).select().single();
-    setLoading(false);
-    if (error) { showToast(error.message, 'error'); return; }
-    setPatients(prev => [data, ...prev]);
-    setForm(EMPTY_FORM);
-    setShowForm(false);
-    showToast(t.saved, 'success');
+    try {
+      const token = await getAccessToken();
+      const row = {
+        ...form,
+        age: Number(form.age),
+        weight: form.weight ? Number(form.weight) : null,
+        temp: form.temp ? Number(form.temp) : null,
+        spo2: form.spo2 ? Number(form.spo2) : null,
+        duration: form.duration || null,
+        duration_unit: form.duration_unit || 'days',
+        bp: form.bp || null,
+      };
+      const res = await fetch('/api/patients', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+        body: JSON.stringify(row),
+      });
+      const data = await res.json();
+      setLoading(false);
+      if (!res.ok) { showToast(data.error || 'Failed to save', 'error'); return; }
+      setPatients(prev => [data, ...prev]);
+      setForm(EMPTY_FORM);
+      setShowForm(false);
+      showToast(t.saved, 'success');
+    } catch (e) {
+      setLoading(false);
+      showToast(e.message, 'error');
+    }
   }
 
   async function handleDelete(id) {
-    const { error } = await supabase.from('patients').delete().eq('id', id);
-    if (!error) { setPatients(prev => prev.filter(p => p.id !== id)); if (selected?.id === id) setSelected(null); showToast(t.deleted, 'info'); }
+    try {
+      const token = await getAccessToken();
+      const res = await fetch('/api/patients', {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+        body: JSON.stringify({ id }),
+      });
+      const data = await res.json();
+      if (res.ok) {
+        setPatients(prev => prev.filter(p => p.id !== id));
+        if (selected?.id === id) setSelected(null);
+        showToast(t.deleted, 'info');
+      } else {
+        showToast(data.error || 'Failed to delete', 'error');
+      }
+    } catch (e) {
+      showToast(e.message, 'error');
+    }
   }
 
   // ── ASHA WORKER ──
   async function loadAshaWorker() {
     setAshaFetching(true);
-    const { data, error } = await supabase.from('asha_workers').select('*').order('created_at', { ascending: true }).limit(1);
+    // Fetch worker profile linked to current auth user
+    const { data, error } = await supabase.from('asha_workers').select('*').eq('user_id', user?.id).limit(1);
     if (!error && data && data.length > 0) {
       const w = data[0];
       setAshaId(w.id);
@@ -123,8 +220,8 @@ export default function Dashboard() {
       // Update existing record
       ({ error } = await supabase.from('asha_workers').update(ashaForm).eq('id', ashaId));
     } else {
-      // Insert new record
-      const { data, error: insertError } = await supabase.from('asha_workers').insert([ashaForm]).select().single();
+      // Insert new record — link to current auth user
+      const { data, error: insertError } = await supabase.from('asha_workers').insert([{ ...ashaForm, user_id: user?.id }]).select().single();
       error = insertError;
       if (!insertError && data) setAshaId(data.id);
     }
@@ -188,6 +285,56 @@ export default function Dashboard() {
 
   function showToast(msg, type = 'success') { setToast({ msg, type }); setTimeout(() => setToast(null), 3500); }
 
+  // ── VILLAGE ASSIGNMENTS ──
+  // Soft-delete model: removed_at is set instead of deleting the row.
+  // This preserves history of who had access to which village and when.
+  // RLS checks removed_at IS NULL, so access is revoked immediately.
+  async function loadAssignedVillages() {
+    setVillagesLoading(true);
+    const { data, error } = await supabase
+      .from('worker_villages')
+      .select('id, village, assigned_at')
+      .is('removed_at', null)  // Only active assignments
+      .order('assigned_at', { ascending: true });
+    if (!error) setAssignedVillages(data || []);
+    setVillagesLoading(false);
+  }
+
+  async function addVillage() {
+    const v = newVillage.trim();
+    if (!v) { showToast('Please enter a village name', 'error'); return; }
+    if (assignedVillages.some(av => av.village.toLowerCase() === v.toLowerCase())) {
+      showToast('Village already assigned', 'error');
+      return;
+    }
+    const { data, error } = await supabase
+      .from('worker_villages')
+      .insert([{ user_id: user?.id, village: v }])
+      .select()
+      .single();
+    if (error) { showToast(error.message, 'error'); return; }
+    setAssignedVillages(prev => [...prev, data]);
+    setNewVillage('');
+    showToast(`Village "${v}" assigned! ✅`, 'success');
+    // Reload patients since we might now see patients from this village
+    loadPatients();
+  }
+
+  async function removeVillage(id, villageName) {
+    // Soft-delete: set removed_at instead of deleting the row.
+    // This immediately revokes access (RLS checks removed_at IS NULL)
+    // while preserving the historical record.
+    const { error } = await supabase
+      .from('worker_villages')
+      .update({ removed_at: new Date().toISOString() })
+      .eq('id', id);
+    if (error) { showToast(error.message, 'error'); return; }
+    setAssignedVillages(prev => prev.filter(v => v.id !== id));
+    showToast(`Removed "${villageName}"`, 'info');
+    // Reload patients since we may have lost access to some
+    loadPatients();
+  }
+
   // ── AI DIAGNOSIS ──
   async function runAIDiagnosis() {
     if (!form.symptoms?.trim()) { setAiError('Please enter symptoms first.'); return; }
@@ -200,9 +347,18 @@ Respond ONLY with a valid JSON object, no markdown, no extra text:
 {"conditions":[{"name":"Condition","likelihood":70}],"action":{"type":"treat","label":"Treat at home","summary":"One sentence for ASHA worker."},"medicines":["Paracetamol 500mg every 6 hrs"],"warning_signs":["High fever above 104F"],"diagnosis_text":"Short plain diagnosis, e.g. Likely viral fever — treat at home with paracetamol. Refer if fever persists 3 days."}
 Rules: conditions 2-4 items likelihood<=100 total; action.type must be treat/refer/urgent; medicines OTC only; warning_signs 2-4 items.`;
     try {
-      const res = await fetch('/api/diagnose', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      // Get the current session token for the secured API
+      const { data: { session: currentSession } } = await supabase.auth.getSession();
+      const accessToken = currentSession?.access_token || '';
+
+      const res = await fetch('/api/diagnose', { method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${accessToken}`,
+        },
         body: JSON.stringify({ model: 'claude-sonnet-4-20250514', max_tokens: 1000, messages: [{ role: 'user', content: prompt }] }) });
       const data = await res.json();
+      if (!res.ok) { setAiError(data.error || 'AI analysis failed.'); return; }
       const raw = (data.content || []).map(b => b.text || '').join('');
       const parsed = JSON.parse(raw.replace(/```json|```/g, '').trim());
       setAiResult(parsed);
@@ -465,6 +621,24 @@ Rules: conditions 2-4 items likelihood<=100 total; action.type must be treat/ref
               <select className="lang-select-nav" value={lang} onChange={e => setLang(e.target.value)}>
                 {LANGUAGES.map(l => <option key={l.code} value={l.code}>{l.label}</option>)}
               </select>
+              <button
+                onClick={handleLogout}
+                style={{
+                  background: 'rgba(255,255,255,0.1)',
+                  border: '1px solid rgba(255,255,255,0.2)',
+                  color: 'rgba(255,255,255,0.7)',
+                  borderRadius: '8px',
+                  padding: '0.35rem 0.7rem',
+                  fontSize: '0.78rem',
+                  fontWeight: 600,
+                  fontFamily: "'DM Sans', sans-serif",
+                  cursor: 'pointer',
+                  transition: 'all 0.2s',
+                }}
+                title="Logout"
+              >
+                🚪 Logout
+              </button>
               <button className="hamburger" onClick={() => setSidebarOpen(!sidebarOpen)} aria-label="Toggle menu">
                 {sidebarOpen ? '✕' : '☰'}
               </button>
@@ -631,6 +805,76 @@ Rules: conditions 2-4 items likelihood<=100 total; action.type must be treat/ref
                         {ashaLoading ? <><span className="spinner"/> Saving...</> : ashaId ? '💾 Update Profile' : '💾 Save Profile'}
                       </button>
                     </form>
+                  )}
+                </div>
+
+                {/* Village Assignments */}
+                <div className="settings-card">
+                  <div className="settings-card-title">🏘️ Assigned Villages / गाँव</div>
+                  <div className="settings-card-sub">
+                    Manage the villages you serve. You can see patients from all your assigned villages.
+                    <br />
+                    अपने गाँव जोड़ें — आप अपने सभी गाँवों के मरीज़ देख सकेंगे।
+                  </div>
+
+                  {villagesLoading ? (
+                    <div style={{display:'flex',flexDirection:'column',gap:'0.8rem'}}>{[1,2].map(i=><div key={i} className="skeleton"/>)}</div>
+                  ) : (
+                    <>
+                      {/* Current villages */}
+                      {assignedVillages.length > 0 ? (
+                        <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.5rem', marginBottom: '1rem' }}>
+                          {assignedVillages.map(v => (
+                            <div key={v.id} style={{
+                              display: 'inline-flex', alignItems: 'center', gap: '0.4rem',
+                              background: 'var(--gpale)', border: '1px solid var(--border)',
+                              borderRadius: '50px', padding: '0.4rem 0.6rem 0.4rem 0.9rem',
+                              fontSize: '0.85rem', fontWeight: 600, color: 'var(--g1)',
+                            }}>
+                              📍 {v.village}
+                              <button
+                                onClick={() => removeVillage(v.id, v.village)}
+                                style={{
+                                  background: 'none', border: 'none', cursor: 'pointer',
+                                  color: 'var(--red)', fontSize: '0.85rem', padding: '0.1rem 0.3rem',
+                                  borderRadius: '50%', lineHeight: 1,
+                                }}
+                                title={`Remove ${v.village}`}
+                              >
+                                ✕
+                              </button>
+                            </div>
+                          ))}
+                        </div>
+                      ) : (
+                        <div style={{ background: '#FFF3CD', borderRadius: '10px', padding: '0.7rem 1rem', fontSize: '0.82rem', color: '#633806', marginBottom: '1rem', lineHeight: 1.6 }}>
+                          ⚠️ No villages assigned yet. Add your villages below to start seeing patients.
+                        </div>
+                      )}
+
+                      {/* Add village */}
+                      <div style={{ display: 'flex', gap: '0.5rem' }}>
+                        <input
+                          value={newVillage}
+                          onChange={e => setNewVillage(e.target.value)}
+                          placeholder="Enter village name (e.g. Rampur)"
+                          onKeyDown={e => e.key === 'Enter' && (e.preventDefault(), addVillage())}
+                          style={{ flex: 1 }}
+                        />
+                        <button
+                          type="button"
+                          onClick={addVillage}
+                          style={{
+                            background: 'var(--g2)', color: 'white', border: 'none',
+                            borderRadius: '10px', padding: '0.65rem 1.2rem',
+                            fontWeight: 700, fontSize: '0.85rem', cursor: 'pointer',
+                            fontFamily: "'DM Sans', sans-serif", whiteSpace: 'nowrap',
+                          }}
+                        >
+                          + Add
+                        </button>
+                      </div>
+                    </>
                   )}
                 </div>
 
